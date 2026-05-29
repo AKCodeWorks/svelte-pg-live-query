@@ -149,45 +149,136 @@ pgLiveQuery.fn({
 import { SKIP } from 'svelte-pg-live-query';
 ```
 
-## Exports
+## SKIP example (ignore unrelated updates)
 
-Root exports:
+Use `SKIP` when a notification is valid but not relevant to the current live-query input.
 
-- `createPgLiveQuery`
-- `SKIP`
-- `createPostgresListener`
-- `defaultPostgresListener`
-- `PG_LISTEN_CHANNELS`
+```ts
+import { query } from '$app/server';
+import { createPgLiveQuery, SKIP } from 'svelte-pg-live-query';
 
-Subpath exports are also available:
+type Channels = {
+  user_changes: {
+    operation: 'INSERT' | 'UPDATE' | 'DELETE';
+    table: string;
+    row: { id: number; email: string };
+  };
+};
 
-- `svelte-pg-live-query/pg-live-query`
-- `svelte-pg-live-query/postgres-listener`
-- `svelte-pg-live-query/pg-listen-channels`
+const pgLiveQuery = createPgLiveQuery<Channels>();
 
-## Publish checklist
+export const userByIdLive = query.live(
+  pgLiveQuery.fn({
+    channel: 'user_changes',
+    onInit: async ({ input }: { input: { id: number } }) => {
+      return { id: input.id };
+    },
+    onNotified: async ({ input, payload }) => {
+      // Ignore notifications for other users
+      if (payload.row.id !== input.id) return SKIP;
 
-1. Ensure `src/lib/index.ts` exports your public API
-2. Run:
-
-```sh
-npm run prepack
+      return payload.row;
+    }
+  })
+);
 ```
 
-3. Verify generated `dist/` contains:
+## Database setup requirement
 
-- `index.js` / `index.d.ts`
-- `pg-live-query.js` / `pg-live-query.d.ts`
-- `postgres-listener.js` / `postgres-listener.d.ts`
-- `pg-listen-channels.js` / `pg-listen-channels.d.ts`
+This library does not create database triggers for you. You must create your own Postgres `NOTIFY` triggers/channels that match the channel names and payload shape used in your `createPgLiveQuery` config.
 
-4. Publish:
+PostgreSQL trigger docs:
+- [CREATE TRIGGER](https://www.postgresql.org/docs/current/sql-createtrigger.html)
+
+## Prisma migration example (create + apply trigger)
+
+Below is a minimal example using Prisma migrations to create `NOTIFY` triggers.
+
+### 1) Create an empty migration
 
 ```sh
-npm publish
+npx prisma migrate dev --name add_user_changes_listener --create-only
 ```
 
-## Notes
+This creates a new migration folder with `migration.sql` that you can edit before applying.
 
-- This package is designed for server-side usage in SvelteKit remote functions.
-- `LISTEN/NOTIFY` channel names and payload JSON shape must match your DB triggers.
+### 2) Edit `migration.sql`
+
+```sql
+-- Function that sends one consistent payload shape
+CREATE OR REPLACE FUNCTION notify_table_change() RETURNS trigger AS $$
+DECLARE
+  payload JSON;
+BEGIN
+  payload := json_build_object(
+    'operation', TG_OP,          -- operation type: INSERT | UPDATE | DELETE
+    'table', TG_TABLE_NAME,      -- table name that fired the trigger
+    'row', CASE                  -- row shape returned to your live query payload
+      WHEN TG_OP = 'DELETE' THEN row_to_json(OLD)
+      ELSE row_to_json(NEW)
+    END
+  );
+
+  -- Channel name your app listens to (must match `pgLiveQuery.fn({ channel: ... })`)
+  PERFORM pg_notify('user_changes', payload::text);
+
+  IF (TG_OP = 'DELETE') THEN
+    RETURN OLD;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Trigger name (you choose this; useful for identifying/dropping later)
+CREATE TRIGGER user_notify_changes
+AFTER INSERT OR UPDATE OR DELETE ON "User"
+FOR EACH ROW
+EXECUTE FUNCTION notify_table_change();
+```
+
+### 3) Apply migration to database
+
+```sh
+npx prisma migrate dev
+```
+
+### 4) Match channel + payload type in your live query
+
+```ts
+type Channels = {
+  user_changes: {
+    operation: 'INSERT' | 'UPDATE' | 'DELETE'; // from payload.operation
+    table: string;                              // from payload.table
+    row: { id: number; email: string };         // from payload.row
+  };
+};
+```
+
+```ts
+import { query } from '$app/server';
+import { createPgLiveQuery, SKIP } from 'svelte-pg-live-query';
+import { prisma } from '$lib/server/db'; // your Prisma client path
+
+type Channels = {
+  user_changes: {
+    operation: 'INSERT' | 'UPDATE' | 'DELETE';
+    table: string;
+    row: { id: number; email: string; name: string | null };
+  };
+};
+
+const pgLiveQuery = createPgLiveQuery<Channels>();
+
+export const userByIdLive = query.live(
+  pgLiveQuery.fn({
+    channel: 'user_changes', // must match pg_notify('user_changes', ...)
+    onInit: async ({ input }: { input: { id: number } }) => {
+      return prisma.user.findUnique({ where: { id: input.id } });
+    },
+    onNotified: async ({ input, payload }) => {
+      if (payload.row.id !== input.id) return SKIP; // ignore unrelated updates
+      return prisma.user.findUnique({ where: { id: input.id } });
+    }
+  })
+);
+```
