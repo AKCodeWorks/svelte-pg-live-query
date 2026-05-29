@@ -39,10 +39,6 @@
 		"./postgres-listener": {
 			"types": "./dist/postgres-listener.d.ts",
 			"default": "./dist/postgres-listener.js"
-		},
-		"./pg-listen-channels": {
-			"types": "./dist/pg-listen-channels.d.ts",
-			"default": "./dist/pg-listen-channels.js"
 		}
 	},
 	"peerDependencies": {
