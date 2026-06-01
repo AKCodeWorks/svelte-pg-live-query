@@ -20,6 +20,7 @@ npm install svelte-pg-live-query pg-listen
 - Shared Postgres listener scaffolding under the hood
 - Easy `onInit` + `onNotified` live query model
 - Configurable listener connection/options via factory
+- Built-in heartbeat events to keep idle streams alive
 
 ## Payload shape
 
@@ -91,12 +92,30 @@ export const usersLive = query.live(
 );
 ```
 
+## Stream event envelope
+
+Every emitted item is wrapped in a typed envelope:
+
+```ts
+type PgLiveQueryValue<T> =
+  | { type: 'init'; data: T }
+  | { type: 'update'; data: T }
+  | { type: 'heartbeat'; data: null }
+  | { type: 'error'; data: { message: string } };
+```
+
+- `init`: first successful value from `onInit`
+- `update`: successful value from `onNotified`
+- `heartbeat`: emitted when stream is idle
+- `error`: emitted when `onInit` or `onNotified` throws
+
 ## Factory options
 
 ```ts
 const pgLiveQuery = createPgLiveQuery<Channels>({
   debug: true,
   debounceMs: 50,
+  heartbeatMs: 5000,
   postgres: {
     connectionString: process.env.DATABASE_URL,
     subscriberConfig: {
@@ -115,6 +134,7 @@ const pgLiveQuery = createPgLiveQuery<Channels>({
 
 - `debug?: boolean`
 - `debounceMs?: number`
+- `heartbeatMs?: number` (default: `5000`, set `0` to disable)
 - `postgres?:`
   - `connectionString?: string`
   - `subscriberConfig?: Omit<pg-listen config, 'connectionString'>`
@@ -127,6 +147,7 @@ pgLiveQuery.fn({
   channel: 'user_changes',
   id: 'users-stream',
   debug: true,
+  heartbeatMs: 5000,
   onInit: async ({ input }) => {
     return null;
   },
@@ -144,9 +165,60 @@ pgLiveQuery.fn({
 - `onInit` return value is first `yield`
 - each `onNotified` return value is yielded to clients
 - return `SKIP` to ignore a notification and not emit an update
+- thrown errors from `onInit`/`onNotified` are emitted as `{ type: 'error', data: { message } }`
 
 ```ts
 import { SKIP } from 'svelte-pg-live-query';
+```
+
+## Client consumption pattern (`await query`)
+
+If reading `query.current` causes hydration issues in your app, consume via `await query` and cache the last reliable `init`/`update` value:
+
+```ts
+import type { RemoteLiveQuery } from '@sveltejs/kit';
+import type { PgLiveQueryValue } from 'svelte-pg-live-query/pg-live-query';
+
+type LiveData<TLiveQuery> =
+  TLiveQuery extends RemoteLiveQuery<PgLiveQueryValue<infer TData>> ? TData : never;
+
+type ConsumeWithCache = typeof consumePgLive & {
+  __cache?: WeakMap<object, unknown>;
+};
+
+async function consumePgLive<TLiveQuery extends RemoteLiveQuery<PgLiveQueryValue<unknown>>>(
+  query: TLiveQuery
+) {
+  type TData = LiveData<TLiveQuery>;
+  const fn = consumePgLive as ConsumeWithCache;
+  const cache = (fn.__cache ??= new WeakMap<object, unknown>());
+  const key = query as unknown as object;
+  const event = await query;
+
+  let value = cache.get(key) as TData | undefined;
+  if (
+    event &&
+    (event.type === 'init' || event.type === 'update') &&
+    event.data !== null &&
+    event.data !== undefined
+  ) {
+    value = event.data as TData;
+    cache.set(key, value);
+  }
+
+  const error =
+    event?.type === 'error'
+      ? event.data.message
+      : query.error instanceof Error
+        ? query.error.message
+        : undefined;
+
+  return {
+    value,
+    connected: query.connected,
+    error
+  };
+}
 ```
 
 ## SKIP example (ignore unrelated updates)

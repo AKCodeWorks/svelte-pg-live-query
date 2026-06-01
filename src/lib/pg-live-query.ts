@@ -16,18 +16,26 @@ type LivePostgresNotificationContext<Payload, Input> = {
 	payload: Payload;
 };
 
+type PgLiveQueryValue<Result> =
+	| { type: 'init'; data: Result }
+	| { type: 'update'; data: Result }
+	| { type: 'heartbeat'; data: null }
+	| { type: 'error'; data: { message: string } };
+
 const SKIP = Symbol('skip client update');
 let activeLiveQueryConnections = 0;
 
 type PgLiveQueryFactoryOptions = {
 	debug?: boolean;
 	debounceMs?: number;
+	heartbeatMs?: number;
 	postgres?: CreatePostgresListenerOptions;
 };
 
 type LivePostgresQueryOptions<Channel extends string, Payload, Result, Input = void> = {
 	channel: Channel;
 	debug?: boolean;
+	heartbeatMs?: number;
 	id?: string;
 	onInit: (context: LivePostgresQueryContext<Input>) => MaybePromise<Result>;
 	onNotified: (
@@ -44,10 +52,14 @@ const createPgLiveQuery = <Channels extends Record<string, unknown>>(
 		: defaultPostgresListener;
 	const defaultDebug = factoryOptions.debug ?? false;
 	const debounceMs = factoryOptions.debounceMs ?? 100;
+	const defaultHeartbeatMs = factoryOptions.heartbeatMs ?? 5_000;
+	const toErrorMessage = (error: unknown) =>
+		error instanceof Error ? error.message : 'Unknown live query error';
 
 	const fn = <Channel extends keyof Channels & string, Result, Input = void>({
 		channel,
 		debug = defaultDebug,
+		heartbeatMs = defaultHeartbeatMs,
 		id = '',
 		onInit,
 		onNotified,
@@ -82,11 +94,19 @@ const createPgLiveQuery = <Channels extends Record<string, unknown>>(
 
 			try {
 				const { request } = getRequestEvent();
-				yield await onInit({ input });
+				try {
+					const initialValue = await onInit({ input });
+					yield { type: 'init', data: initialValue } satisfies PgLiveQueryValue<Result>;
+				} catch (error) {
+					yield {
+						type: 'error',
+						data: { message: toErrorMessage(error) }
+					} satisfies PgLiveQueryValue<Result>;
+				}
 
 				while (!request.signal.aborted) {
 					if (queue.length === 0) {
-						await new Promise<void>((resolve) => {
+						const waitForNotificationOrAbort = new Promise<void>((resolve) => {
 							const onAbort = () => {
 								request.signal.removeEventListener('abort', onAbort);
 								wake = undefined;
@@ -101,16 +121,37 @@ const createPgLiveQuery = <Channels extends Record<string, unknown>>(
 
 							request.signal.addEventListener('abort', onAbort, { once: true });
 						});
+
+						if (heartbeatMs > 0) {
+							await Promise.race([
+								waitForNotificationOrAbort,
+								new Promise<void>((resolve) => setTimeout(resolve, heartbeatMs))
+							]);
+
+							if (queue.length === 0 && !request.signal.aborted) {
+								yield { type: 'heartbeat', data: null } satisfies PgLiveQueryValue<Result>;
+								continue;
+							}
+						} else {
+							await waitForNotificationOrAbort;
+						}
 					}
 
 					while (queue.length > 0) {
 						const payload = queue.shift();
 						if (!payload) continue;
 
-						const nextValue = await onNotified({ input, payload });
-						if (nextValue === SKIP) continue;
+						try {
+							const nextValue = await onNotified({ input, payload });
+							if (nextValue === SKIP) continue;
 
-						yield nextValue;
+							yield { type: 'update', data: nextValue } satisfies PgLiveQueryValue<Result>;
+						} catch (error) {
+							yield {
+								type: 'error',
+								data: { message: toErrorMessage(error) }
+							} satisfies PgLiveQueryValue<Result>;
+						}
 						if (debounceMs > 0) {
 							await new Promise((resolve) => setTimeout(resolve, debounceMs));
 						}
@@ -128,3 +169,4 @@ const createPgLiveQuery = <Channels extends Record<string, unknown>>(
 };
 
 export { createPgLiveQuery, SKIP };
+export type { PgLiveQueryValue };

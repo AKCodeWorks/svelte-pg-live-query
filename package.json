@@ -1,6 +1,6 @@
 {
 	"name": "svelte-pg-live-query",
-	"version": "0.0.2",
+	"version": "0.1.0",
 	"scripts": {
 		"dev": "vite dev",
 		"build": "bun --bun vite build && npm run prepack",
@@ -39,6 +39,10 @@
 		"./postgres-listener": {
 			"types": "./dist/postgres-listener.d.ts",
 			"default": "./dist/postgres-listener.js"
+		},
+		"./consume-pg-live": {
+			"types": "./dist/consume-pg-live.d.ts",
+			"default": "./dist/consume-pg-live.js"
 		}
 	},
 	"peerDependencies": {
