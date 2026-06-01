@@ -19,8 +19,8 @@ type LivePostgresNotificationContext<Payload, Input> = {
 type PgLiveQueryValue<Result> =
 	| { type: 'init'; data: Result }
 	| { type: 'update'; data: Result }
-	| { type: 'heartbeat'; data: null }
-	| { type: 'error'; data: { message: string } };
+	| { type: 'heartbeat'; data: Result | null }
+	| { type: 'error'; data: null; error: { message: string } };
 
 const SKIP = Symbol('skip client update');
 let activeLiveQueryConnections = 0;
@@ -80,6 +80,7 @@ const createPgLiveQuery = <Channels extends Record<string, unknown>>(
 			activeLiveQueryConnections += 1;
 
 			const queue: Channels[Channel][] = [];
+			let lastSent: Result | null = null;
 			let wake: (() => void) | undefined;
 
 			const onPostgresNotification = (payload: Channels[Channel]) => {
@@ -96,11 +97,13 @@ const createPgLiveQuery = <Channels extends Record<string, unknown>>(
 				const { request } = getRequestEvent();
 				try {
 					const initialValue = await onInit({ input });
+					lastSent = initialValue;
 					yield { type: 'init', data: initialValue } satisfies PgLiveQueryValue<Result>;
 				} catch (error) {
 					yield {
 						type: 'error',
-						data: { message: toErrorMessage(error) }
+						data: null,
+						error: { message: toErrorMessage(error) }
 					} satisfies PgLiveQueryValue<Result>;
 				}
 
@@ -129,7 +132,7 @@ const createPgLiveQuery = <Channels extends Record<string, unknown>>(
 							]);
 
 							if (queue.length === 0 && !request.signal.aborted) {
-								yield { type: 'heartbeat', data: null } satisfies PgLiveQueryValue<Result>;
+								yield { type: 'heartbeat', data: lastSent } satisfies PgLiveQueryValue<Result>;
 								continue;
 							}
 						} else {
@@ -144,12 +147,15 @@ const createPgLiveQuery = <Channels extends Record<string, unknown>>(
 						try {
 							const nextValue = await onNotified({ input, payload });
 							if (nextValue === SKIP) continue;
+							if (Object.is(nextValue, lastSent)) continue;
 
+							lastSent = nextValue;
 							yield { type: 'update', data: nextValue } satisfies PgLiveQueryValue<Result>;
 						} catch (error) {
 							yield {
 								type: 'error',
-								data: { message: toErrorMessage(error) }
+								data: null,
+								error: { message: toErrorMessage(error) }
 							} satisfies PgLiveQueryValue<Result>;
 						}
 						if (debounceMs > 0) {

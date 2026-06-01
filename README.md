@@ -171,56 +171,6 @@ pgLiveQuery.fn({
 import { SKIP } from 'svelte-pg-live-query';
 ```
 
-## Client consumption pattern (`await query`)
-
-If reading `query.current` causes hydration issues in your app, consume via `await query` and cache the last reliable `init`/`update` value:
-
-```ts
-import type { RemoteLiveQuery } from '@sveltejs/kit';
-import type { PgLiveQueryValue } from 'svelte-pg-live-query/pg-live-query';
-
-type LiveData<TLiveQuery> =
-  TLiveQuery extends RemoteLiveQuery<PgLiveQueryValue<infer TData>> ? TData : never;
-
-type ConsumeWithCache = typeof consumePgLive & {
-  __cache?: WeakMap<object, unknown>;
-};
-
-async function consumePgLive<TLiveQuery extends RemoteLiveQuery<PgLiveQueryValue<unknown>>>(
-  query: TLiveQuery
-) {
-  type TData = LiveData<TLiveQuery>;
-  const fn = consumePgLive as ConsumeWithCache;
-  const cache = (fn.__cache ??= new WeakMap<object, unknown>());
-  const key = query as unknown as object;
-  const event = await query;
-
-  let value = cache.get(key) as TData | undefined;
-  if (
-    event &&
-    (event.type === 'init' || event.type === 'update') &&
-    event.data !== null &&
-    event.data !== undefined
-  ) {
-    value = event.data as TData;
-    cache.set(key, value);
-  }
-
-  const error =
-    event?.type === 'error'
-      ? event.data.message
-      : query.error instanceof Error
-        ? query.error.message
-        : undefined;
-
-  return {
-    value,
-    connected: query.connected,
-    error
-  };
-}
-```
-
 ## SKIP example (ignore unrelated updates)
 
 Use `SKIP` when a notification is valid but not relevant to the current live-query input.
